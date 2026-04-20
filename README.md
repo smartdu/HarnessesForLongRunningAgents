@@ -589,7 +589,182 @@ Superpowers选择了Orchestrator-Subagent模式，并增加了两个强化措施
 | 最难的问题 | 五个难题同时出现 | 无人值守时如何替代人的角色 | 多Agent之间如何不踩脚 |
 | 对应的工作流 | 顺序+评估器-优化器 | 自动化工作流（Routines） | 并行工作流+协调模式 |
 
-**→ 过渡到Ch5：** 三个场景展示了零件如何组装。但"Every component in a harness encodes an assumption about what the model can't do on its own"——场景一中的3-Agent Harness是针对Opus 4.5设计的，到了Opus 4.6有些组件就不再承重了。模型在变，组装方式也要跟着变。
+**→ 过渡到案例章：** 三个场景展示了零件如何组装，但都是概念层面的。读者可能会问：有没有一个真实的项目，把这些零件完整地落地了？Superpowers就是这样一个案例。
+
+---
+
+## 案例章 Superpowers深度剖析——一个完整落地的长时运行Harness
+
+**为什么选Superpowers作为案例？** 前面的Ch3给了零件，Ch4给了组装场景，但都是基于Anthropic官方文章的概念性描述。Superpowers是一个真实存在的、开源的、可安装的Harness实现——它把Ch3的每一个零件都落地为具体的技能文件、Hook脚本和Agent定义。分析它，读者能看到从概念到实现的完整路径。
+
+### 案例一：Superpowers如何解决Ch2的五个难题
+
+**难题一：上下文焦虑 → Superpowers的子智能体隔离**
+
+Superpowers的核心执行引擎是`subagent-driven-development`技能。它的第一条规则：
+
+> "They should never inherit your session's context or history — you construct exactly what they need." [来源: Superpowers — subagent-driven-development/SKILL.md]
+
+每个任务派发一个新子智能体，控制器（主Agent）只保留协调工作的上下文。这意味着：
+- 主Agent永远不会"快满了"，因为它不承载实现细节
+- 子智能体从干净状态开始，不会因为之前任务的残留信息而焦虑
+- 控制器一次性提取计划中所有任务的全文，然后逐个粘贴给子智能体——子智能体甚至不需要读计划文件 [来源: Superpowers — subagent-driven-development/SKILL.md Red Flags: "Never make subagent read plan file (provide full text instead)"]
+
+**难题二：过早标记完成 → Superpowers的三重防线**
+
+防线1：**两阶段审查**。每个子智能体完成任务后，不是自己说"完成了"就行，而是必须经过两个独立审查子智能体 [来源: Superpowers — subagent-driven-development/SKILL.md]：
+- **规格合规审查**（spec-reviewer）："Do NOT trust the implementer's report. Read the actual code. Compare against requirements line by line." [来源: Superpowers — subagent-driven-development/spec-reviewer-prompt.md]
+- **代码质量审查**（code-quality-reviewer）：仅在规格合规通过后启动
+- 顺序严格强制："Never start code quality review before spec compliance is ✅" [来源: Superpowers — subagent-driven-development/SKILL.md Red Flags]
+
+防线2：**证据优先验证**。`verification-before-completion`技能设立了Iron Law：
+
+> "NO COMPLETION CLAIMS WITHOUT FRESH VERIFICATION EVIDENCE" [来源: Superpowers — verification-before-completion/SKILL.md]
+
+它强制一个5步门控函数：IDENTIFY（什么命令能证明）→ RUN（运行命令）→ READ（读输出）→ VERIFY（确认）→ ONLY THEN（才能声称）。任何"should"、"probably"、"seems to"都被列为Red Flag。该技能记录了24次过早声称完成导致的实际事故 [来源: Superpowers — verification-before-completion/SKILL.md "From 24 failure memories"]。
+
+防线3：**TDD的Iron Law**。`test-driven-development`技能规定：
+
+> "NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST" [来源: Superpowers — test-driven-development/SKILL.md]
+
+如果先写了代码再写测试？删掉重来。"Don't keep it as 'reference'. Don't 'adapt' it while writing tests. Don't look at it. Delete means delete." [来源: Superpowers — test-driven-development/SKILL.md]
+
+**难题三：上下文退化 → Superpowers的渐进式披露 + 强制技能检查**
+
+Superpowers用两个机制对抗退化：
+
+机制1：**描述即触发器设计（CSO）**。技能的description字段只写触发条件，不摘要工作流。为什么？测试发现当description摘要了工作流时，Claude会跟着描述走而非读取完整技能正文 [来源: Superpowers — writing-skills/SKILL.md CSO section]：
+
+> "A description saying 'code review between tasks' caused Claude to do ONE review, even though the skill's flowchart clearly showed TWO reviews (spec compliance then code quality)."
+
+改为只写"Use when executing implementation plans with independent tasks"后，Claude正确读取了完整流程图。这是3.3中"渐进式披露"原则的具体实现——不一次性给所有信息，按需加载。
+
+机制2：**强制技能检查**。`using-superpowers`技能在每个会话启动时通过Hook注入 [来源: Superpowers — hooks/session-start]，规定：
+
+> "If you think there is even a 1% chance a skill might apply to what you are doing, you ABSOLUTELY MUST invoke the skill." [来源: Superpowers — using-superpowers/SKILL.md]
+
+并附12条Red Flags列表，每条都是Agent不检查技能的常见借口及其反驳。这防止了Agent在长时运行中"忘记"使用技能——退化的一种表现。
+
+**难题四：跨会话记忆断层 → Superpowers的会话启动注入**
+
+Superpowers的`session-start` Hook在每次会话启动（包括`/clear`和`/compact`后）自动注入`using-superpowers`技能全文 [来源: Superpowers — hooks/session-start]：
+
+```
+Hook触发（startup|clear|compact）
+  → 读取skills/using-superpowers/SKILL.md全文
+  → 包裹在<EXTREMELY_IMPORTANT>标签中
+  → 注入为additionalContext
+```
+
+这确保了每个新会话——即使是压缩或清除后——都会重新加载技能意识。结合Claude Code自身的CLAUDE.md机制（项目根CLAUDE.md在/compact后重新注入），形成了双重保障。
+
+**难题五：自主与安全 → Superpowers的Worktree隔离**
+
+`using-git-worktrees`技能强制在开始实现前创建隔离工作空间 [来源: Superpowers — using-git-worktrees/SKILL.md]：
+- 在独立分支上工作，主分支不受影响
+- 验证目录已被gitignore
+- 运行项目设置，验证测试基线是干净的
+- 完成后提供4个选项：合并/推送创建PR/保持/丢弃，丢弃需要输入"discard"确认
+
+### 案例二：Superpowers如何约束用户——一个"不信任Agent"的设计哲学
+
+Superpowers的设计哲学不是"信任Agent会做对"，而是"假设Agent会偷懒、会找借口、会在压力下放弃原则" [推断: 基于所有技能中大量的Rationalization Table和Red Flags列表]。这导致了对用户的特殊约束——用户不能随意绕过流程。
+
+**约束1：强制先设计后编码**
+
+brainstorming技能有HARD-GATE：
+
+> "Do NOT invoke any implementation skill, write any code, scaffold any project, or take any implementation action until you have presented a design and the user has approved it." [来源: Superpowers — brainstorming/SKILL.md]
+
+并显式针对反模式："This Is Too Simple To Need A Design"——每个项目都必须走这个流程，即使是一个配置变更。用户不能直接说"别废话了开始写代码"来绕过——因为技能的优先级高于默认行为 [来源: Superpowers — using-superpowers/SKILL.md Instruction Priority]。
+
+**约束2：计划中禁止占位符**
+
+writing-plans技能禁止所有模糊指令 [来源: Superpowers — writing-plans/SKILL.md]：
+- "TBD"、"TODO"、"implement later"
+- "Add appropriate error handling"（没有具体代码）
+- "Write tests for the above"（没有实际测试代码）
+- "Similar to Task N"（必须重复代码，因为子智能体可能不按顺序读任务）
+
+用户不能通过说"随便写个计划就行"来降低质量标准——计划中每一步必须包含完整的代码和精确的命令。
+
+**约束3：用户指令 > 技能指令，但技能会提醒你**
+
+Superpowers的优先级体系是 [来源: Superpowers — using-superpowers/SKILL.md Instruction Priority]：
+1. 用户的显式指令（CLAUDE.md、直接请求）— 最高优先
+2. Superpowers技能 — 覆盖默认系统行为
+3. 默认系统提示 — 最低优先
+
+如果用户在CLAUDE.md中写"不要用TDD"，技能会服从。但技能通过Iron Law和Rationalization Table显式告知用户绕过的后果——用户是有意识地选择放弃保护，而不是无意中遗漏。
+
+**约束4：技能本身也要用TDD来写**
+
+writing-skills技能把TDD原则应用到技能创作本身 [来源: Superpowers — writing-skills/SKILL.md]：
+
+> "NO SKILL WITHOUT A FAILING TEST FIRST"
+
+写技能前，必须先用压力场景测试Agent在没有该技能时的行为（RED），然后写技能（GREEN），然后关闭漏洞（REFACTOR）。这意味着用户不能"随便写个技能"——每个技能必须经过对抗性测试。
+
+**约束5：说服力研究支持纪律强化**
+
+Superpowers的writing-skills技能引用了Meincke et al. (2025, N=28,000)的研究 [来源: Superpowers — writing-skills/persuasion-principles.md]：Authority（"YOU MUST"、"No exceptions"）+ Commitment（公开声明、追踪）+ Social Proof（"Every time"）的组合使合规率从33%提升到72%。这不是凭直觉写规则——而是用实验数据指导措辞。
+
+### 案例三：Superpowers的完整工作流管线——从想法到合并
+
+把Superpowers的14个技能串成一条完整的管线 [来源: Superpowers — README.md]：
+
+```
+用户说"我想做一个X"
+  │
+  ├─ [brainstorming] 探索意图，一次一个问题，分段呈现设计
+  │   HARD-GATE: 用户批准设计前不能写代码
+  │   反模式: "这太简单了不需要设计"
+  │
+  ├─ [using-git-worktrees] 创建隔离工作空间
+  │   验证: 目录gitignored、测试基线干净
+  │
+  ├─ [writing-plans] 拆分为2-5分钟粒度的任务
+  │   禁止: TBD/TODO/占位符
+  │   每步包含: 完整代码 + 精确命令 + 预期输出
+  │
+  ├─ [subagent-driven-development] 逐任务派发子智能体
+  │   每个任务: 新子智能体实现 → 规格合规审查 → 代码质量审查
+  │   审查不通过: 修复 → 再审查，循环直到通过
+  │   模型选择: 机械任务用便宜模型，审查用最强模型
+  │
+  │   子智能体内部遵循:
+  │   ├─ [test-driven-development] RED-GREEN-REFACTOR
+  │   │   Iron Law: 先写测试看它失败，再写代码
+  │   │   先写了代码? 删掉重来
+  │   │
+  │   ├─ [systematic-debugging] 4阶段根因调查
+  │   │   Iron Law: 没找到根因前不能提修复
+  │   │   3次修复失败? 质疑架构
+  │   │
+  │   └─ [verification-before-completion] 5步门控
+  │       Iron Law: 没运行验证命令就不能声称完成
+  │       24次过早声称完成的事故记录
+  │
+  ├─ [requesting-code-review] 任务间代码审查
+  │   派发独立审查子智能体
+  │   三级: Critical(必须修)/Important(修完再走)/Minor(记录)
+  │
+  └─ [finishing-a-development-branch] 验证→选择→清理
+      验证测试通过后提供4选项: 合并/PR/保持/丢弃
+```
+
+**这条管线覆盖了Ch2的每个难题：**
+- 焦虑：子智能体隔离 + 小任务粒度
+- 过早完成：两阶段审查 + 证据优先验证 + TDD
+- 退化：渐进式披露(CSO) + 强制技能检查(session-start Hook)
+- 断层：会话启动注入 + 计划文件持久化 + git commit
+- 安全：Worktree隔离 + 审查子智能体
+
+**Superpowers的独特之处：不只是工具，是方法论**
+
+与Claude Code内置的能力（/compact、/clear、Auto Mode）不同，Superpowers不是一组独立的工具，而是一条强制管线。工具可以挑着用，管线必须走完。这是它对"Ch4零件怎么组装"这个问题的回答：不是让你选零件，而是帮你定义了唯一正确的顺序。
+
+**→ 过渡到Ch5：** Superpowers的管线针对当前模型（Sonnet 4.5/4.6, Opus 4.5/4.6）设计。但"Every component in a harness encodes an assumption about what the model can't do on its own"——当模型能力变了，Superpowers的哪些Iron Law可能变为多余？
 
 ---
 
@@ -656,6 +831,12 @@ Superpowers选择了Orchestrator-Subagent模式，并增加了两个强化措施
           · 一句话→完整应用：全部五组零件协同
           · 无人值守修Bug：持久化+安全为主
           · 多Agent并行：隔离+裁判+协调机制
+                       │
+                       ↓
+          完整落地案例：Superpowers
+          · 14个技能 → 强制管线（非可选工具）
+          · 三重防线防过早完成：两阶段审查+证据验证+TDD
+          · 说服力研究指导措辞：合规率33%→72%
                        │
                        ↓
           模型在进化 → Harness假设需要持续检验
